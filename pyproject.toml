@@ -16,6 +16,7 @@ description = "Foundry - CUDA Graph Extension"
 requires-python = ">=3.10"
 dependencies = [
     "torch",
+    "tomli; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]
