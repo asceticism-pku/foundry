@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <string>
 #include <variant>
+#include <vector>
 #include <boost/json.hpp>
 #undef cuGetProcAddress
 #undef cuCtxCreate
@@ -72,6 +73,8 @@ std::variant<CUfunction, CUkernel> query_function_handle(uint64_t binary_hash,
 uint64_t query_binary_hash(std::variant<CUmodule, CUlibrary> handle);
 void mark_binary_used(uint64_t binary_hash);
 void load_cuda_modules_and_libraries(const std::string& archive_dir);
+void load_cuda_modules_and_libraries_from_archives(
+    const std::vector<std::string>& archive_dirs);
 
 }  // namespace foundry
 #endif

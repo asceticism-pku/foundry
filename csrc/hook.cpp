@@ -20,6 +20,7 @@
 #include <fstream>
 #include <vector>
 #include <string_view>
+#include <stdexcept>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/socket.h>
@@ -1761,7 +1762,13 @@ static const char* prior_function(const char* symbol) {
   static char buf[256];
 
   size_t len = strlen(symbol);
-  if (len >= 3 && strcmp(symbol + len - 3, "_v3") == 0) {
+  if (len >= 3 && strcmp(symbol + len - 3, "_v4") == 0) {
+    size_t copy_len = len - 3;
+    memcpy(buf, symbol, copy_len);
+    buf[copy_len] = '\0';
+    strcat(buf, "_v3");
+    return buf;
+  } else if (len >= 3 && strcmp(symbol + len - 3, "_v3") == 0) {
     size_t copy_len = len - 3;
     memcpy(buf, symbol, copy_len);
     buf[copy_len] = '\0';
@@ -1791,6 +1798,9 @@ static void* try_load_symbol(void* handle, const char* symbol) {
 
   const char* prior = prior_function(tmpfunc);
   while (prior) {
+    ptr = real_dlsym(handle, prior);
+    if (ptr)
+      return ptr;
     ptr = real_dlsym(RTLD_NEXT, prior);
     if (ptr)
       return ptr;
@@ -4336,11 +4346,219 @@ static ParsedOptions parse_function_and_options(const std::string& func_line) {
   return result;
 }
 
-void load_cuda_modules_and_libraries(const std::string& archive_dir) {
-  if (binary_loaded.load()) {
-    fprintf(stderr, "[HOOK] ERROR: Binaries already loaded\n");
-    abort();
+struct PackedBinaryEntry {
+  uint64_t hash = 0;
+  std::vector<uint8_t> data;
+  std::string func_name;
+  ParsedOptions options;
+  std::vector<std::string> entry_names;
+  std::vector<std::vector<uint8_t>> linked_segments;
+  std::string source_archive;
+};
+
+static std::runtime_error packed_archive_error(const fs::path& archive_dir,
+                                               const std::string& message) {
+  return std::runtime_error("Foundry packed archive '" + archive_dir.string() + "': " + message);
+}
+
+static std::vector<PackedBinaryEntry> read_packed_archive(const fs::path& archive_dir) {
+  const fs::path packed_img_path = archive_dir / "fatbin_image_packed.img";
+  const fs::path packed_txt_path = archive_dir / "fatbin_entrypoint_packed.txt";
+
+  if (!fs::exists(packed_img_path) || !fs::exists(packed_txt_path)) {
+    throw packed_archive_error(archive_dir, "packed image or metadata file is missing");
   }
+
+  std::ifstream img_file(packed_img_path.string(), std::ios::binary);
+  std::ifstream txt_file(packed_txt_path.string());
+  if (!img_file || !txt_file) {
+    throw packed_archive_error(archive_dir, "failed to open packed files");
+  }
+
+  const uintmax_t packed_img_size = fs::file_size(packed_img_path);
+  std::vector<PackedBinaryEntry> binaries;
+  while (true) {
+    uint64_t hash = 0;
+    img_file.read(reinterpret_cast<char*>(&hash), sizeof(uint64_t));
+    if (img_file.gcount() == 0 && img_file.eof()) {
+      break;
+    }
+    if (img_file.gcount() != static_cast<std::streamsize>(sizeof(uint64_t))) {
+      throw packed_archive_error(archive_dir, "truncated binary hash");
+    }
+
+    size_t size = 0;
+    img_file.read(reinterpret_cast<char*>(&size), sizeof(size_t));
+    if (!img_file) {
+      throw packed_archive_error(archive_dir,
+                                 "truncated binary size for hash " + std::to_string(hash));
+    }
+
+    PackedBinaryEntry entry;
+    entry.hash = hash;
+    entry.source_archive = archive_dir.string();
+
+    if (size == 0) {
+      size_t num_segments = 0;
+      img_file.read(reinterpret_cast<char*>(&num_segments), sizeof(size_t));
+      if (!img_file || num_segments == 0 || num_segments > packed_img_size / sizeof(size_t)) {
+        throw packed_archive_error(
+            archive_dir, "invalid linked segment count for hash " + std::to_string(hash));
+      }
+
+      entry.linked_segments.reserve(num_segments);
+      for (size_t i = 0; i < num_segments; i++) {
+        size_t segment_size = 0;
+        img_file.read(reinterpret_cast<char*>(&segment_size), sizeof(size_t));
+        if (!img_file || segment_size == 0 || segment_size > packed_img_size) {
+          throw packed_archive_error(
+              archive_dir, "invalid linked segment size for hash " + std::to_string(hash));
+        }
+
+        std::vector<uint8_t> segment(segment_size);
+        img_file.read(reinterpret_cast<char*>(segment.data()), segment_size);
+        if (!img_file) {
+          throw packed_archive_error(
+              archive_dir, "truncated linked segment for hash " + std::to_string(hash));
+        }
+        entry.linked_segments.push_back(std::move(segment));
+      }
+    } else {
+      if (size > packed_img_size) {
+        throw packed_archive_error(archive_dir,
+                                   "invalid binary size for hash " + std::to_string(hash));
+      }
+      entry.data.resize(size);
+      img_file.read(reinterpret_cast<char*>(entry.data.data()), size);
+      if (!img_file) {
+        throw packed_archive_error(archive_dir,
+                                   "truncated binary data for hash " + std::to_string(hash));
+      }
+    }
+
+    binaries.push_back(std::move(entry));
+  }
+
+  if (binaries.empty()) {
+    throw packed_archive_error(archive_dir, "contains no binaries");
+  }
+
+  for (auto& binary : binaries) {
+    std::string hash_line;
+    std::string entrypoint_count_line;
+    if (!std::getline(txt_file, hash_line) || !std::getline(txt_file, binary.func_name) ||
+        !std::getline(txt_file, entrypoint_count_line)) {
+      throw packed_archive_error(archive_dir, "truncated binary metadata");
+    }
+
+    try {
+      size_t parsed_chars = 0;
+      const uint64_t metadata_hash = std::stoull(hash_line, &parsed_chars, 16);
+      if (parsed_chars != hash_line.size() || metadata_hash != binary.hash) {
+        throw packed_archive_error(
+            archive_dir, "image/metadata hash mismatch for hash " + std::to_string(binary.hash));
+      }
+
+      parsed_chars = 0;
+      const unsigned long entrypoint_count =
+          std::stoul(entrypoint_count_line, &parsed_chars, 10);
+      if (parsed_chars != entrypoint_count_line.size()) {
+        throw packed_archive_error(archive_dir,
+                                   "invalid entrypoint count for hash " +
+                                       std::to_string(binary.hash));
+      }
+
+      binary.entry_names.reserve(entrypoint_count);
+      for (unsigned long i = 0; i < entrypoint_count; i++) {
+        std::string entrypoint_name;
+        if (!std::getline(txt_file, entrypoint_name)) {
+          throw packed_archive_error(archive_dir,
+                                     "truncated entrypoint list for hash " +
+                                         std::to_string(binary.hash));
+        }
+        binary.entry_names.push_back(std::move(entrypoint_name));
+      }
+    } catch (const std::invalid_argument&) {
+      throw packed_archive_error(archive_dir, "invalid numeric metadata field");
+    } catch (const std::out_of_range&) {
+      throw packed_archive_error(archive_dir, "numeric metadata field is out of range");
+    }
+
+    std::string delimiter;
+    if (!std::getline(txt_file, delimiter) || delimiter != "---") {
+      throw packed_archive_error(archive_dir,
+                                 "missing metadata delimiter for hash " +
+                                     std::to_string(binary.hash));
+    }
+
+    binary.options = parse_function_and_options(binary.func_name);
+    if (!binary.linked_segments.empty() &&
+        binary.options.num_segments != binary.linked_segments.size()) {
+      throw packed_archive_error(archive_dir,
+                                 "linked segment metadata mismatch for hash " +
+                                     std::to_string(binary.hash));
+    }
+  }
+
+  std::string trailing_line;
+  while (std::getline(txt_file, trailing_line)) {
+    if (!trailing_line.empty()) {
+      throw packed_archive_error(archive_dir, "metadata contains extra binary records");
+    }
+  }
+  return binaries;
+}
+
+static bool packed_binary_entries_equal(const PackedBinaryEntry& lhs,
+                                        const PackedBinaryEntry& rhs) {
+  return lhs.data == rhs.data && lhs.func_name == rhs.func_name &&
+         lhs.entry_names == rhs.entry_names && lhs.linked_segments == rhs.linked_segments;
+}
+
+static std::vector<PackedBinaryEntry> read_packed_archives(
+    const std::vector<std::string>& archive_dirs) {
+  if (archive_dirs.empty()) {
+    throw std::runtime_error("No Foundry packed archive directories were provided");
+  }
+
+  std::map<uint64_t, PackedBinaryEntry> binaries_by_hash;
+  for (const auto& archive_dir_string : archive_dirs) {
+    const fs::path archive_dir(archive_dir_string);
+    auto archive_binaries = read_packed_archive(archive_dir);
+    for (auto& binary : archive_binaries) {
+      auto existing = binaries_by_hash.find(binary.hash);
+      if (existing == binaries_by_hash.end()) {
+        binaries_by_hash.emplace(binary.hash, std::move(binary));
+        continue;
+      }
+      if (!packed_binary_entries_equal(existing->second, binary)) {
+        throw std::runtime_error("Conflicting Foundry binary hash " +
+                                 std::to_string(binary.hash) + " in archives '" +
+                                 existing->second.source_archive + "' and '" +
+                                 binary.source_archive + "'");
+      }
+    }
+  }
+
+  std::vector<PackedBinaryEntry> binaries;
+  binaries.reserve(binaries_by_hash.size());
+  for (auto& [hash, binary] : binaries_by_hash) {
+    binaries.push_back(std::move(binary));
+  }
+  return binaries;
+}
+
+void load_cuda_modules_and_libraries_from_archives(
+    const std::vector<std::string>& archive_dirs) {
+  if (binary_loaded.load()) {
+    throw std::runtime_error("Foundry CUDA binaries are already loaded");
+  }
+
+  // Parse and validate every archive before changing CUDA process state. This
+  // prevents a late archive conflict from leaving a partially loaded runtime.
+  auto binaries = read_packed_archives(archive_dirs);
+  const size_t archive_count = archive_dirs.size();
+  const size_t binary_count = binaries.size();
 
   // FIXME: this will reset memory region, try to avoid that
   // Ensure CUDA context exists before loading modules.
@@ -4441,142 +4659,7 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
   // bumps the later fixed-address reserve (intermittent TP LOAD failures).
   try_early_region_reserve();
 
-  std::call_once(load_once_flag, [&archive_dir]() {
-    const fs::path packed_img_path = fs::path(archive_dir) / "fatbin_image_packed.img";
-    const fs::path packed_txt_path = fs::path(archive_dir) / "fatbin_entrypoint_packed.txt";
-
-    if (!fs::exists(packed_img_path) || !fs::exists(packed_txt_path)) {
-      fprintf(stderr, "[HOOK] ERROR: Packed files not found in %s\n", archive_dir.c_str());
-      abort();
-    }
-
-    std::ifstream img_file(packed_img_path.string(), std::ios::binary);
-    std::ifstream txt_file(packed_txt_path.string());
-
-    if (!img_file || !txt_file) {
-      fprintf(stderr, "[HOOK] ERROR: Failed to open packed files\n");
-      abort();
-    }
-
-    struct BinaryEntry {
-      uint64_t hash;
-      std::vector<uint8_t> data;
-      std::string func_name;
-      ParsedOptions options;
-      std::vector<std::string> entry_names;
-      // For device-linked binaries
-      std::vector<std::vector<uint8_t>> linked_segments;
-    };
-
-    std::vector<BinaryEntry> binaries;
-
-    while (img_file) {
-      uint64_t hash = 0;
-      size_t size = 0;
-
-      img_file.read(reinterpret_cast<char*>(&hash), sizeof(uint64_t));
-      if (!img_file)
-        break;
-
-      img_file.read(reinterpret_cast<char*>(&size), sizeof(size_t));
-      if (!img_file) {
-        fprintf(stderr, "[HOOK] ERROR: Failed to read size\n");
-        abort();
-      }
-
-      BinaryEntry entry;
-      entry.hash = hash;
-
-      if (size == 0) {
-        // Device-linked binary marker - read segment count and segments
-        size_t num_segments = 0;
-        img_file.read(reinterpret_cast<char*>(&num_segments), sizeof(size_t));
-        if (!img_file || num_segments == 0) {
-          fprintf(stderr, "[HOOK] ERROR: Invalid segment count for device-linked binary\n");
-          abort();
-        }
-
-#ifdef FOUNDRY_DEBUG
-        fprintf(stderr, "[HOOK] DEBUG: Reading %zu linked segments for hash %016llx\n",
-                num_segments, (unsigned long long)hash);
-#endif
-
-        for (size_t i = 0; i < num_segments; i++) {
-          size_t seg_size = 0;
-          img_file.read(reinterpret_cast<char*>(&seg_size), sizeof(size_t));
-          if (!img_file || seg_size == 0) {
-            fprintf(stderr, "[HOOK] ERROR: Invalid segment size\n");
-            abort();
-          }
-
-          std::vector<uint8_t> seg_data(seg_size);
-          img_file.read(reinterpret_cast<char*>(seg_data.data()), seg_size);
-          if (!img_file) {
-            fprintf(stderr, "[HOOK] ERROR: Failed to read segment data\n");
-            abort();
-          }
-
-          entry.linked_segments.push_back(std::move(seg_data));
-#ifdef FOUNDRY_DEBUG
-          fprintf(stderr, "[HOOK] DEBUG:   segment[%zu] size: %zu bytes\n", i, seg_size);
-#endif
-        }
-      } else {
-        // Regular single binary
-        entry.data.resize(size);
-        img_file.read(reinterpret_cast<char*>(entry.data.data()), size);
-        if (!img_file) {
-          fprintf(stderr, "[HOOK] ERROR: Failed to read binary data\n");
-          abort();
-        }
-      }
-
-      binaries.push_back(std::move(entry));
-    }
-
-    size_t binary_idx = 0;
-    std::string line;
-    int state = 0;
-    unsigned int expected_count = 0;
-
-    while (std::getline(txt_file, line)) {
-      if (line == "---") {
-        binary_idx++;
-        state = 0;
-        expected_count = 0;
-        continue;
-      }
-
-      if (binary_idx >= binaries.size()) {
-        fprintf(stderr, "[HOOK] ERROR: Mismatch between img and txt files\n");
-        abort();
-      }
-
-      auto& binary = binaries[binary_idx];
-
-      if (state == 0) {
-        uint64_t txt_hash = std::strtoull(line.c_str(), nullptr, 16);
-        if (txt_hash != binary.hash) {
-          fprintf(stderr, "[HOOK] ERROR: Hash mismatch: img=%016llx, txt=%016llx\n",
-                  (unsigned long long)binary.hash, (unsigned long long)txt_hash);
-          abort();
-        }
-        state = 1;
-      } else if (state == 1) {
-        binary.func_name = line;
-        binary.options = parse_function_and_options(line);
-        state = 2;
-      } else if (state == 2) {
-        expected_count = std::stoul(line);
-        state = 3;
-      } else if (state == 3) {
-        binary.entry_names.push_back(line);
-        if (binary.entry_names.size() >= expected_count) {
-          state = 4;
-        }
-      }
-    }
-
+  std::call_once(load_once_flag, [binaries = std::move(binaries)]() mutable {
     typedef CUresult (*cuModuleLoadData_t)(CUmodule*, const void*);
     typedef CUresult (*cuModuleLoadDataEx_t)(CUmodule*, const void*, unsigned int, CUjit_option*,
                                              void**);
@@ -4754,7 +4837,8 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
         }
 
         const fs::path temp_file_path =
-            fs::path(archive_dir) / str(boost::format("temp_module_%016llx.bin") % binary.hash);
+            fs::path(binary.source_archive) /
+            str(boost::format("temp_module_%016llx.bin") % binary.hash);
         std::ofstream temp_file(temp_file_path.string(), std::ios::binary);
         if (!temp_file) {
           fprintf(stderr, "[HOOK] ERROR: Failed to create temporary file for module loading\n");
@@ -4783,7 +4867,8 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
         }
 
         const fs::path temp_file_path =
-            fs::path(archive_dir) / str(boost::format("temp_library_%016llx.bin") % binary.hash);
+            fs::path(binary.source_archive) /
+            str(boost::format("temp_library_%016llx.bin") % binary.hash);
         std::ofstream temp_file(temp_file_path.string(), std::ios::binary);
         if (!temp_file) {
           fprintf(stderr, "[HOOK] ERROR: Failed to create temporary file for library loading\n");
@@ -4835,9 +4920,14 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
   });
 
   if (!binary_loaded.load()) {
-    fprintf(stderr, "[HOOK] ERROR: Binary loading failed\n");
-    abort();
+    throw std::runtime_error("Foundry CUDA binary loading failed");
   }
+  fprintf(stderr, "[HOOK] Loaded %zu unique binaries from %zu packed archives\n", binary_count,
+          archive_count);
+}
+
+void load_cuda_modules_and_libraries(const std::string& archive_dir) {
+  load_cuda_modules_and_libraries_from_archives({archive_dir});
 }
 
 }  // namespace foundry

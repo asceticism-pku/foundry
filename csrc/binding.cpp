@@ -86,6 +86,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("archive_dir"), "Load CUDA modules and libraries from archive directory");
 
   m.def(
+      "load_cuda_modules_and_libraries_from_archives",
+      [](const std::vector<std::string>& archive_dirs) {
+        ::foundry::load_cuda_modules_and_libraries_from_archives(archive_dirs);
+      },
+      py::arg("archive_dirs"),
+      "Load and deduplicate CUDA modules and libraries from multiple archive directories");
+
+  m.def(
       "preallocate_cublas_workspaces", []() { ::foundry::preallocate_cublas_workspaces(); },
       "Pre-allocate cuBLAS and cuBLASLt handles and workspaces for the current stream");
 
