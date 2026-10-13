@@ -62,7 +62,7 @@ flowchart LR
 ```
 
 - **Memory.** Every device allocation is funneled into a single VMM region `[base_addr, base_addr + region_size)`. A monotonic cursor gives every tensor a byte-deterministic offset; the underlying physical mapping is done with `cuMemCreate` + `cuMemMap`.
-- **Modules / libraries.** As device code is loaded, the fatbin bytes and the `entry_name → CUfunction` table are recorded.
+- **Modules / libraries.** As device code is loaded, the fatbin bytes and the `entry_name → CUfunction` table are recorded. A device-linked library passed to `cuLibraryLoadData` (NCCL's) is archived as passed and restored with the same call and options, never re-linked.
 - **Captured graphs.** Each captured `CUgraph` is serialized and then grouped with other graphs that share the same topology (same kernels, dependency DAG and cluster dimensions; they differ only in kernel parameters). One graph per group is kept as the **template**; the rest are stored as **on-demand members** that carry only their per-node kernel parameters.
 
 **SAVE** writes all three pieces to an archive. **LOAD** pre-maps the same VMM range, re-loads the same modules from the packed fatbins, builds each template's `CUgraph` node by node once, and then produces every member by rewriting the template's node parameters, either into a **dedicated** `CUgraphExec` per member (default, eager or lazy) or into one shared exec per template switched with `cuGraphExecUpdate`. Either way restored graphs replay at native speed; kernel handles embedded in the captured graphs resolve to the same device addresses they had at SAVE time. See [`docs/graph-templates.md`](docs/graph-templates.md) for the design and measurements.
