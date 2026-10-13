@@ -175,7 +175,14 @@ enum BinaryFlags : uint32_t {
   BINARY_FLAG_NEEDS_DEVICE_LINK =
       1 << 0,  // Binary needs device linking at LOAD time (segments stored separately)
   BINARY_FLAG_REQUIRES_NVSHMEM = 1 << 1,  // Module requires NVSHMEM initialization
+  // cuLibraryLoadData of a FATBINC_LINK_VERSION wrapper: the wrapper's own fatbin and its prelinked
+  // fatbins are archived as passed and LOAD rebuilds the wrapper for cuLibraryLoadData (no linker).
+  BINARY_FLAG_PRESERVED_IMAGE = 1 << 2,
 };
+
+// Packed-image entry kinds: `size > 0` is one binary; `size == 0` is followed by a segment count
+// (device-link segments, older archives) or by this marker (BINARY_FLAG_PRESERVED_IMAGE entry).
+inline constexpr size_t kPreservedImageMarker = ~size_t{0};
 
 using ModuleHandles = std::tuple<CUmodule, std::unordered_map<std::string, CUfunction>>;
 using LibraryHandles = std::tuple<CUlibrary, std::unordered_map<std::string, CUkernel>>;
@@ -192,6 +199,11 @@ struct BinaryMetadata {
   bool used = false;
   std::vector<std::vector<uint8_t>> linked_fatbin_segments;
   uint32_t binary_flags = BINARY_FLAG_NONE;  // Bit flags for binary properties
+  // BINARY_FLAG_PRESERVED_IMAGE: the link wrapper's header fields and its `data` fatbin (the
+  // device-linked image; empty if null). The prelinked fatbins are in linked_fatbin_segments.
+  uint32_t wrapper_magic = 0;
+  uint32_t wrapper_version = 0;
+  std::vector<uint8_t> wrapper_data;
 };
 
 static std::atomic<int> dumped_binary_counter{0};
@@ -754,6 +766,13 @@ static void dump_fatbin_and_info(const void* data_ptr, std::string_view func_nam
   std::vector<uint8_t> concatenated_fatbin;
   // Store individual segments for device linking during load
   std::vector<std::vector<uint8_t>> linked_fatbin_segments;
+  // cuLibraryLoadData of a link wrapper: keep the wrapper as the application passed it (its
+  // device-linked `data` fatbin plus the prelinked fatbins) so LOAD hands the driver the same
+  // image. Re-linking the prelinked fatbins with cuLinkAddData is not equivalent: the driver's
+  // linker rejects relocatable cubins from a newer toolkit (NCCL 2.30.7 built with CUDA 13.3 on
+  // a 13.2 driver: error 209) even though the driver loads the wrapper itself.
+  bool preserve_wrapper = false;
+  std::vector<uint8_t> wrapper_data;
 
   if (format == BinaryFormat::WRAPPER) {
     const auto* wrapper = static_cast<const __fatBinC_Wrapper_t*>(data_ptr);
@@ -783,7 +802,21 @@ static void dump_fatbin_and_info(const void* data_ptr, std::string_view func_nam
       fprintf(stderr, "[HOOK] DEBUG: FATBINC_LINK_VERSION wrapper has %zu fatbin entries\n",
               num_fatbins);
 #endif
-      if (num_fatbins == 1) {
+      if (func_name == "cuLibraryLoadData") {
+        const auto* linked = reinterpret_cast<const uint8_t*>(wrapper->data);
+        if (!linked) {
+          preserve_wrapper = true;
+        } else if (*reinterpret_cast<const uint32_t*>(linked) == FATBIN_MAGIC) {
+          preserve_wrapper = true;
+          wrapper_data.assign(linked, linked + compute_fatbin_size(linked));
+        } else {
+          fprintf(stderr,
+                  "[HOOK] WARNING: link wrapper data is not a fatbin (magic %08x); recording its "
+                  "segments for the device linker\n",
+                  *reinterpret_cast<const uint32_t*>(linked));
+        }
+      }
+      if (num_fatbins == 1 && !preserve_wrapper) {
         // Single fatbin, use directly
         binary_data = static_cast<const uint8_t*>(fatbin_array[0]);
         total_size = compute_fatbin_size(binary_data);
@@ -898,8 +931,15 @@ static void dump_fatbin_and_info(const void* data_ptr, std::string_view func_nam
     }
   }
 
-  // Store linked fatbin segments if this is a device-linked library
-  if (!linked_fatbin_segments.empty()) {
+  if (preserve_wrapper) {
+    const auto* wrapper = static_cast<const __fatBinC_Wrapper_t*>(data_ptr);
+    metadata.binary_flags |= BINARY_FLAG_PRESERVED_IMAGE;
+    metadata.wrapper_magic = static_cast<uint32_t>(wrapper->magic);
+    metadata.wrapper_version = static_cast<uint32_t>(wrapper->version);
+    metadata.wrapper_data = std::move(wrapper_data);
+    metadata.linked_fatbin_segments = std::move(linked_fatbin_segments);
+  } else if (!linked_fatbin_segments.empty()) {
+    // Store linked fatbin segments if this is a device-linked library
     metadata.binary_flags |= BINARY_FLAG_NEEDS_DEVICE_LINK;
     metadata.linked_fatbin_segments = std::move(linked_fatbin_segments);
 #ifdef FOUNDRY_DEBUG
@@ -1798,6 +1838,8 @@ static void pack_fatbins_to_folder_impl(const fs::path& archive_dir) {
     // Compute final binary_flags for this binary
     uint32_t binary_flags = metadata.binary_flags;
     std::vector<uint8_t> linked_cubin;
+    // A preserved image never carries NEEDS_DEVICE_LINK, so it is never pre-linked.
+    const bool preserved = binary_flags & BINARY_FLAG_PRESERVED_IMAGE;
     bool has_segments =
         (binary_flags & BINARY_FLAG_NEEDS_DEVICE_LINK) && !metadata.linked_fatbin_segments.empty();
 
@@ -1812,7 +1854,30 @@ static void pack_fatbins_to_folder_impl(const fs::path& archive_dir) {
       }
     }
 
-    if (!linked_cubin.empty()) {
+    if (preserved) {
+      // size = 0, kPreservedImageMarker, wrapper magic/version (uint32 each), segment count, then
+      // the wrapper's data fatbin and each segment as (size, zero padding to an 8-byte file
+      // offset, bytes), so the mmapped images handed to the driver at LOAD are 8-byte aligned.
+      const size_t marker = 0;
+      const size_t kind = kPreservedImageMarker;
+      const size_t num_segments = metadata.linked_fatbin_segments.size();
+      packed_img.write(reinterpret_cast<const char*>(&marker), sizeof(size_t));
+      packed_img.write(reinterpret_cast<const char*>(&kind), sizeof(size_t));
+      packed_img.write(reinterpret_cast<const char*>(&metadata.wrapper_magic), sizeof(uint32_t));
+      packed_img.write(reinterpret_cast<const char*>(&metadata.wrapper_version), sizeof(uint32_t));
+      packed_img.write(reinterpret_cast<const char*>(&num_segments), sizeof(size_t));
+      auto write_blob = [&](const std::vector<uint8_t>& blob) {
+        const size_t blob_size = blob.size();
+        packed_img.write(reinterpret_cast<const char*>(&blob_size), sizeof(size_t));
+        static const char zeros[8] = {};
+        packed_img.write(zeros, (8 - static_cast<size_t>(packed_img.tellp()) % 8) % 8);
+        packed_img.write(reinterpret_cast<const char*>(blob.data()), blob_size);
+      };
+      write_blob(metadata.wrapper_data);
+      for (const auto& segment : metadata.linked_fatbin_segments) {
+        write_blob(segment);
+      }
+    } else if (!linked_cubin.empty()) {
       // Write pre-linked cubin (stored same as normal binary)
       const size_t size = linked_cubin.size();
       packed_img.write(reinterpret_cast<const char*>(&size), sizeof(size_t));
@@ -1871,7 +1936,7 @@ static void pack_fatbins_to_folder_impl(const fs::path& archive_dir) {
 
     // Write binary_flags and num_segments if needed
     packed_txt << ",binary_flags=" << binary_flags;
-    if (has_segments) {
+    if (has_segments || preserved) {
       packed_txt << ",num_segments=" << metadata.linked_fatbin_segments.size();
     }
 
@@ -4663,8 +4728,18 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
       abort();
     }
 
+    // BINARY_FLAG_PRESERVED_IMAGE entry: the link wrapper rebuilt over the archived images. It is
+    // never freed: the library is loaded with CU_LIBRARY_BINARY_IS_PRESERVED, so the driver keeps
+    // referring to the wrapper and its images (views into the mapping, or `owned` when read).
+    struct PreservedImage {
+      __fatBinC_Wrapper_t wrapper{};
+      std::vector<void*> fatbins;  // nullptr-terminated, as in the application's wrapper
+      std::vector<std::vector<uint8_t>> owned;
+      size_t bytes = 0;
+    };
     struct BinaryEntry {
       uint64_t hash;
+      PreservedImage* preserved = nullptr;
       std::vector<uint8_t> data;
       std::string func_name;
       ParsedOptions options;
@@ -4727,9 +4802,40 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
         size_t size = 0;
         take(&entry.hash, sizeof(uint64_t));
         take(&size, sizeof(size_t));
+        size_t num_segments = 0;
         if (size == 0) {
-          size_t num_segments = 0;
           take(&num_segments, sizeof(size_t));
+        }
+        if (size == 0 && num_segments == kPreservedImageMarker) {
+          auto* img = new PreservedImage();
+          uint32_t magic = 0, version = 0;
+          take(&magic, sizeof(uint32_t));
+          take(&version, sizeof(uint32_t));
+          take(&num_segments, sizeof(size_t));
+          auto take_blob = [&]() -> const uint8_t* {
+            size_t blob_size = 0;
+            take(&blob_size, sizeof(size_t));
+            cur += (8 - cur % 8) % 8;
+            if (cur + blob_size > map_len) {
+              fprintf(stderr, "[HOOK] ERROR: packed image truncated inside binary %016llx\n",
+                      (unsigned long long)entry.hash);
+              abort();
+            }
+            const uint8_t* blob = blob_size ? map_base + cur : nullptr;
+            cur += blob_size;
+            img->bytes += blob_size;
+            return blob;
+          };
+          img->wrapper.magic = static_cast<int>(magic);
+          img->wrapper.version = static_cast<int>(version);
+          img->wrapper.data = reinterpret_cast<const unsigned long long*>(take_blob());
+          for (size_t i = 0; i < num_segments; i++) {
+            img->fatbins.push_back(const_cast<uint8_t*>(take_blob()));
+          }
+          img->fatbins.push_back(nullptr);
+          img->wrapper.filename_or_fatbins = img->fatbins.data();
+          entry.preserved = img;
+        } else if (size == 0) {
           if (num_segments == 0) {
             fprintf(stderr, "[HOOK] ERROR: Invalid segment count for device-linked binary\n");
             abort();
@@ -4774,10 +4880,43 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
       BinaryEntry entry;
       entry.hash = hash;
 
+      size_t num_segments = 0;
       if (size == 0) {
-        // Device-linked binary marker - read segment count and segments
-        size_t num_segments = 0;
         img_file.read(reinterpret_cast<char*>(&num_segments), sizeof(size_t));
+      }
+      if (size == 0 && img_file && num_segments == kPreservedImageMarker) {
+        auto* img = new PreservedImage();
+        uint32_t magic = 0, version = 0;
+        img_file.read(reinterpret_cast<char*>(&magic), sizeof(uint32_t));
+        img_file.read(reinterpret_cast<char*>(&version), sizeof(uint32_t));
+        img_file.read(reinterpret_cast<char*>(&num_segments), sizeof(size_t));
+        img->owned.reserve(num_segments + 1);
+        for (size_t i = 0; i <= num_segments && img_file; i++) {
+          size_t blob_size = 0;
+          img_file.read(reinterpret_cast<char*>(&blob_size), sizeof(size_t));
+          img_file.ignore((8 - static_cast<size_t>(img_file.tellg()) % 8) % 8);
+          img->owned.emplace_back(blob_size);
+          img_file.read(reinterpret_cast<char*>(img->owned.back().data()), blob_size);
+          img->bytes += blob_size;
+        }
+        if (!img_file) {
+          fprintf(stderr, "[HOOK] ERROR: Failed to read preserved image for hash %016llx\n",
+                  (unsigned long long)hash);
+          abort();
+        }
+        img->wrapper.magic = static_cast<int>(magic);
+        img->wrapper.version = static_cast<int>(version);
+        if (!img->owned[0].empty()) {
+          img->wrapper.data = reinterpret_cast<const unsigned long long*>(img->owned[0].data());
+        }
+        for (size_t i = 1; i < img->owned.size(); i++) {
+          img->fatbins.push_back(img->owned[i].data());
+        }
+        img->fatbins.push_back(nullptr);
+        img->wrapper.filename_or_fatbins = img->fatbins.data();
+        entry.preserved = img;
+      } else if (size == 0) {
+        // Device-linked binary marker - read segment count and segments
         if (!img_file || num_segments == 0) {
           fprintf(stderr, "[HOOK] ERROR: Invalid segment count for device-linked binary\n");
           abort();
@@ -4923,6 +5062,28 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
 
         CUresult res;
 
+        if (binary.preserved) {
+          // The link wrapper exactly as the application passed it: the driver resolves it the
+          // way it did at SAVE (no cuLinkAddData).
+          total_bytes += binary.preserved->bytes;
+          res = library_load_data(&library, &binary.preserved->wrapper, jit_opts, jit_vals, num_jit,
+                                  lib_opts, lib_vals, num_lib);
+          if (res != CUDA_SUCCESS || !library) {
+            fprintf(stderr,
+                    "[HOOK] ERROR: Failed to load preserved library for hash %016llx, error=%d\n",
+                    (unsigned long long)binary.hash, res);
+            abort();
+          }
+          setup_handles_for_library(library, binary.hash, binary.entry_names,
+                                    binary.options.binary_flags & BINARY_FLAG_REQUIRES_NVSHMEM);
+          fprintf(stderr,
+                  "[HOOK] restored library %016llx via cuLibraryLoadData (%zu bytes, %zu "
+                  "kernels)\n",
+                  (unsigned long long)binary.hash, binary.preserved->bytes,
+                  binary.entry_names.size());
+          continue;
+        }
+
         if (!binary.linked_segments.empty()) {
           // Device-linked binary - use CUDA linker to combine segments (fallback path)
 #ifdef FOUNDRY_DEBUG
@@ -4999,6 +5160,10 @@ void load_cuda_modules_and_libraries(const std::string& archive_dir) {
         }
         setup_handles_for_library(library, binary.hash, binary.entry_names,
                                   binary.options.binary_flags & BINARY_FLAG_REQUIRES_NVSHMEM);
+      } else if (binary.preserved) {
+        fprintf(stderr, "[HOOK] ERROR: Preserved image recorded for %s (hash %016llx)\n",
+                binary.options.base_func_name.c_str(), (unsigned long long)binary.hash);
+        abort();
       } else if (binary.options.base_func_name == "cuModuleLoadDataEx") {
         CUmodule module = nullptr;
         CUjit_option* jit_opts =

@@ -3,6 +3,13 @@
 Release candidate of 0.1.0: the first release on PyPI (`foundry-core`, import
 name `foundry`) and the first one SGLang can depend on.
 
+## Next release (since 0.1.0rc2)
+
+- A device-linked library loaded with `cuLibraryLoadData` (NCCL 2.30.7) is
+  restored with the same call instead of `cuLinkAddData`, which failed with
+  error 209 on drivers older than the library's toolkit. Archives must be
+  re-saved to use it; older archives still load.
+
 ## Highlights
 
 - `pip install foundry-core`: manylinux_2_28 wheels for CPython 3.10-3.13,
