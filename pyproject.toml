@@ -13,7 +13,7 @@ build-backend = "setuptools.build_meta"
 name = "foundry"
 version = "0.0.3"
 description = "Foundry - CUDA Graph Extension"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.11"
 dependencies = [
     "torch",
     "tomli; python_version < '3.11'",

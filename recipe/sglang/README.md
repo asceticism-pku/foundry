@@ -91,7 +91,7 @@ Use a dedicated env, kept separate from the vLLM env so kernel pins don't clash
 0.4.6+ is built against the torch 2.13 C++ ABI):
 
 ```bash
-python3.12 -m venv venv && source venv/bin/activate
+python3.10 -m venv venv && source venv/bin/activate
 pip install "torch==2.13.0" --index-url https://download.pytorch.org/whl/cu130
 
 # in-tree sglang fork (branch foundry), editable — this pulls the FULL

@@ -6,8 +6,8 @@ setup, the lint / format toolchain, and the commit-time checks.
 ## Environment
 
 ```bash
-# 1. Create / activate a venv (Python ≥ 3.10).
-conda create -p venv/ python=3.12 && conda activate venv/
+# 1. Create / activate a venv (standard CPython 3.10).
+conda create -p venv/ python=3.10 && conda activate venv/
 
 # 2. Build Foundry editable.
 pip install -e . --no-build-isolation

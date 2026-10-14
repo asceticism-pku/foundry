@@ -5,6 +5,14 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import platform
+import sys
+import sysconfig
+
+if (platform.python_implementation() != "CPython" or sys.version_info[:2] != (3, 10)
+        or sysconfig.get_config_var("Py_GIL_DISABLED")):
+    raise RuntimeError("Foundry requires standard CPython 3.10 (>=3.10,<3.11) with the GIL enabled.")
+
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension, include_paths, library_paths
 

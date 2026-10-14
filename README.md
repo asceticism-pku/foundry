@@ -3,7 +3,7 @@
   <p><em>Instantaneous CUDA graph restoration via execution context materialization.</em></p>
 
   <p>
-    <a href="https://www.python.org/"><img alt="Python" src="https://img.shields.io/badge/Python-3.12-blue"></a>
+    <a href="https://www.python.org/"><img alt="Python" src="https://img.shields.io/badge/Python-3.10-blue"></a>
     <a href="https://arxiv.org/abs/2604.06664"><img alt="arXiv" src="https://img.shields.io/badge/arXiv-2604.06664-b31b1b?logo=arxiv&logoColor=white&labelColor=555555"></a>
     <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/License-Apache_2.0-green.svg"></a>
   </p>

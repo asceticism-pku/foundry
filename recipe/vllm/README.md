@@ -44,7 +44,7 @@ The recipes assume the standard workspace layout — `vllm/` (the foundry-org vL
 ### 1. Create a clean Python env
 
 ```bash
-conda create -p venv/ python=3.12
+conda create -p venv/ python=3.10
 conda activate venv/
 conda install -c conda-forge boost-cpp boost     # foundry C++ deps
 pip install cmake                                 # must be cmake 4.0.0+; re-enter the venv to verify
