@@ -13,7 +13,7 @@ each cause, how it was found and what fixed it, so the replay design in
 | every batch-size switch synchronized the device and rewrote the whole exec | replay path | update only on a member change, overlapped with the in-flight forward; same-member replays launch directly |
 | `cuGraphExecUpdate` cleared the exec's constant-prefetch plan | CUDA driver's update path | the prefetch bits are restored on the updated descriptors after every update |
 
-Bench for the last two: `tests/bench_exec_update.py`.
+Bench for the last two: `tools/bench/bench_exec_update.py`.
 
 ## 1. PDL edges were rebuilt as full dependencies
 
@@ -65,7 +65,8 @@ against a fresh exec of the same mutated graph, H200):
   re-upload do not recover it; only a fresh instantiate does.
 - The cost is on the GPU timeline, about 0.1 us per demoted node per replay,
   linear in the dirty-node count (365/365 nodes: +13%) and independent of
-  kernel duration. Execs of at most 128 nodes are exempt.
+  kernel duration. On execs of at most 128 nodes the microbench showed no cost, but only because its
+  constants stayed cache-resident; several such execs replaying in turn pay it too.
 - Production decode graphs (365+ nodes, grids unique per batch size) sit in
   the full-penalty regime.
 
@@ -78,8 +79,7 @@ driver's generic descriptor builder, which rewrites a node's QMD on
 `cuGraphExecUpdate`, keeps the addresses and sizes but clears exactly those
 bits (CB5 `VALID` on the normal chain, CB0 `PREFETCH` on the PDL chain), and
 nothing recomputes the plan after an update. The demoted nodes are the ones
-replaying without prefetch; the 128-node exemption is where the plan is not
-built in the first place.
+replaying without prefetch; small execs hide it only while their constants stay cached.
 
 Fix: restore the plan after every update. At LOAD each template's pristine
 exec is inventoried once: for every kernel node, the QMD's prefetch state and
@@ -101,7 +101,12 @@ the one-step-ahead scheduler.
 
 ## Design
 
-Foundry LOAD keeps one exec per template and switches members with
-`cuGraphExecUpdate` plus the descriptor repair; a same-member replay launches
-directly. Memory is one exec per template rather than one per member, and
-every member replays at the speed of a captured graph.
+- Eager (default): every member gets its own exec in LOAD Phase 2; no exec is ever updated, so no replay pays section 3.
+- Share (`FOUNDRY_ENABLE_EXEC_SHARE=1`): one exec per template, uploaded right after instantiate; a member switch is
+  rewrite, `cuGraphExecUpdate_v2`, upload (section 2; repair: next item); a same-member replay launches directly.
+- Repair seam: `cgp_exec_register_begin/expect/end`, `cgp_exec_update`, `cgp_exec_forget` are weak symbols
+  (`include/CgpWeak.h`). With cudagraph-patch in `LD_PRELOAD` they resolve: each template exec is registered (with its census) around its
+  instantiate and switched with `cgp_exec_update`. Otherwise they are null and the switch is the plain
+  `cuGraphExecUpdate_v2` (section 3 penalty). LOAD logs `[foundry] exec share: patched route (cgp)` or
+  `[foundry] exec share: real cuGraphExecUpdate`.
+- Modes, knobs and the LOAD pipeline: [`graph-templates.md`](graph-templates.md#exec-modes).

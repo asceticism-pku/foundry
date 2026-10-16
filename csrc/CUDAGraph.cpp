@@ -33,6 +33,7 @@
 #include "hook.h"
 #include "BinaryGraphFormat.h"
 #include "GraphDependencies.h"
+#include "ExecShare.h"
 
 #include <torch/version.h>
 
@@ -854,25 +855,18 @@ CUDAGraph::OnDemandData::~OnDemandData() {
   }
 }
 
-void CUDAGraph::materialize_on_demand_exec() {
+void CUDAGraph::bind_shared_exec() {
   TORCH_CHECK(on_demand_data_ && on_demand_data_->shared_exec,
-              "materialize_on_demand_exec: graph is not linked to a shared exec");
+              "bind_shared_exec: graph is not linked to a shared exec");
   auto& shared = on_demand_data_->shared_exec;
-  if (on_demand_data_->own_exec) {
-    return;
-  }
-  if (shared->current_params_id == on_demand_data_->graph_id) {
-    // Template: the shared exec was instantiated with these params.
-    on_demand_data_->own_exec = shared->exec;
-    on_demand_data_->owns_exec = false;
-    return;
-  }
-  // Member: rewrite the shared graph's node params to this graph and
-  // instantiate a dedicated exec. Execs are snapshots, so the template's exec
-  // and earlier members' execs are untouched; the shared graph is a builder.
-  // ~5 ms for a ~1000-node graph; totals are printed with the Phase 2 line.
-  rewrite_shared_graph_for_member();
-  instantiate_member_exec();
+  // Template (the shared exec was instantiated with these params), or share
+  // mode: replay switches the shared exec to this graph before launch. An
+  // eager member owns the exec Phase 2 instantiated for it instead.
+  TORCH_CHECK(shared->share || shared->current_params_id == on_demand_data_->graph_id,
+              "bind_shared_exec: eager member ", on_demand_data_->graph_name,
+              " cannot launch the template's exec");
+  on_demand_data_->own_exec = shared->exec;
+  on_demand_data_->owns_exec = false;
 }
 
 void CUDAGraph::rewrite_shared_graph_for_member() {
@@ -904,15 +898,59 @@ void CUDAGraph::instantiate_member_exec() {
 }
 
 void CUDAGraph::replay() {
-  // On-demand replay: the template launches the shared exec; a member gets its
-  // own exec instantiated on first replay (one-time cost per batch size).
-  // Nothing calls cuGraphExecUpdate: an exec updated in place launches every
-  // node slower for the rest of its life.
+  // Eager: every graph launches its own exec (the template's is the shared one).
+  // Share (FOUNDRY_ENABLE_EXEC_SHARE=1): a replay of another member than the
+  // last one rewrites the builder graph to this member, updates the shared exec
+  // from it (cuGraphExecUpdate) and uploads it; a repeat of the same member
+  // launches directly. No stream or device synchronization.
   if (on_demand_data_) {
-    if (!on_demand_data_->own_exec) {
-      materialize_on_demand_exec();
-    }
     c10::OptionalDeviceGuard device_guard{c10::Device(c10::kCUDA, capture_dev_)};
+    auto& shared = *on_demand_data_->shared_exec;
+    std::unique_lock<std::mutex> replay_lock(shared.replay_mutex, std::defer_lock);
+    if (shared.share) {
+      // Held through the launch submission: one member's params on the exec at a time.
+      replay_lock.lock();
+      TORCH_CHECK(shared.valid, "exec share: an earlier switch of this template's exec failed (",
+                  on_demand_data_->graph_name, ")");
+      if (shared.current_params_id != on_demand_data_->graph_id) {
+        using clk = std::chrono::steady_clock;
+        auto ns_since = [](clk::time_point t) {
+          return static_cast<uint64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now() - t).count());
+        };
+        shared.valid = false;
+        auto t = clk::now();
+        apply_on_demand_updates();
+        shared.rewrite_ns += ns_since(t);
+        t = clk::now();
+        CUgraphExecUpdateResultInfo info{};
+        if (cgp_exec_update) {
+          // cudagraph-patch: prepare + cuGraphExecUpdate_v2 + finish on a registered exec.
+          // Until the patch passes unregistered / inert cases through to the real update,
+          // any nonzero return means the exec was not (correctly) updated.
+          const int rc = cgp_exec_update(shared.exec, shared.graph, &info);
+          shared.update_ns += ns_since(t);
+          TORCH_CHECK(rc == 0 && info.result == CU_GRAPH_EXEC_UPDATE_SUCCESS,
+                      "exec share: cgp_exec_update failed for ", on_demand_data_->graph_name,
+                      " (rc ", rc, ", update result ", static_cast<int>(info.result), ")");
+        } else {
+          CUresult rc = cuGraphExecUpdate_v2(shared.exec, shared.graph, &info);
+          shared.update_ns += ns_since(t);
+          TORCH_CHECK(rc == CUDA_SUCCESS && info.result == CU_GRAPH_EXEC_UPDATE_SUCCESS,
+                      "exec share: cuGraphExecUpdate failed for ", on_demand_data_->graph_name,
+                      " (CUresult ", static_cast<int>(rc), ", update result ",
+                      static_cast<int>(info.result), ")");
+        }
+        t = clk::now();
+        C10_CUDA_DRIVER_CHECK(cuGraphUpload(shared.exec, at::cuda::getCurrentCUDAStream()));
+        shared.upload_ns += ns_since(t);
+        shared.current_params_id = on_demand_data_->graph_id;
+        shared.updates++;
+        shared.valid = true;
+      }
+    }
+    TORCH_CHECK(on_demand_data_->own_exec, "replay: ", on_demand_data_->graph_name,
+                " has no exec (LOAD Phase 2 did not finish)");
     for (auto& [generator_state, wholegraph_increments] : captured_generator_states_) {
 #if FOUNDRY_TORCH_PER_CAPTURE_RNG
       generator_state->replay_prologue(capture_id_, wholegraph_increments);
@@ -999,11 +1037,98 @@ cudaGraphExec_t CUDAGraph::raw_cuda_graph_exec() {
 
 CUDAGraph::SharedGraphExec::~SharedGraphExec() {
   if (exec) {
+    if (share && cgp_exec_forget)
+      cgp_exec_forget(exec);  // an exec it never registered returns CGP_E_UNKNOWN_EXEC
     C10_CUDA_CHECK_WARN(cudaGraphExecDestroy(reinterpret_cast<cudaGraphExec_t>(exec)));
   }
   if (graph) {
     C10_CUDA_CHECK_WARN(cudaGraphDestroy(reinterpret_cast<cudaGraph_t>(graph)));
   }
+}
+
+void CUDAGraph::instantiate_shared_template(SharedGraphExec& shared) {
+  if (!cgp_exec_register_begin || !cgp_exec_register_end) {
+    shared.exec = reinterpret_cast<CUgraphExec>(
+        instantiate_graph_exec(reinterpret_cast<cudaGraph_t>(shared.graph)));
+  } else {
+    // cudagraph-patch records the exec's descriptors during this instantiate (same thread).
+    // Census of the public graph for cgp_exec_register_expect: CUfunction per kernel
+    // node, memcpy nodes, programmatic (PDL) edges.
+    std::vector<void*> functions;
+    unsigned memcpy_nodes = 0;
+    for (CUgraphNode node : shared.ordered_nodes) {
+      CUgraphNodeType type;
+      C10_CUDA_DRIVER_CHECK(cuGraphNodeGetType(node, &type));
+      if (type == CU_GRAPH_NODE_TYPE_KERNEL) {
+        CUDA_KERNEL_NODE_PARAMS params{};
+        C10_CUDA_DRIVER_CHECK(cuGraphKernelNodeGetParams(node, &params));
+        if (!params.func && params.kern)
+          C10_CUDA_DRIVER_CHECK(cuKernelGetFunction(&params.func, params.kern));
+        TORCH_CHECK(params.func, "exec share: cannot resolve a kernel node's CUfunction");
+        functions.push_back(reinterpret_cast<void*>(params.func));
+      } else {
+        memcpy_nodes += type == CU_GRAPH_NODE_TYPE_MEMCPY;
+      }
+    }
+    size_t count = 0;
+    C10_CUDA_DRIVER_CHECK(cuGraphGetEdges_v2(shared.graph, nullptr, nullptr, nullptr, &count));
+    std::vector<CUgraphNode> from(count), to(count);
+    std::vector<CUgraphEdgeData> edges(count);
+    C10_CUDA_DRIVER_CHECK(
+        cuGraphGetEdges_v2(shared.graph, from.data(), to.data(), edges.data(), &count));
+    unsigned pdl_edges = 0;
+    for (const auto& edge : edges)
+      pdl_edges += edge.type == CU_GRAPH_DEPENDENCY_TYPE_PROGRAMMATIC;
+    const unsigned kernels = static_cast<unsigned>(functions.size());
+    int rc = cgp_exec_register_begin();
+    if (rc)
+      fprintf(stderr, "[foundry] exec share: cgp_exec_register_begin failed (%d)\n", rc);
+    try {
+      if (cgp_exec_register_expect) {
+        cgp_census_t census{};
+        census.struct_size = sizeof(census);
+        census.functions = functions.data();
+        census.function_count = kernels;
+        census.pdl_edges = pdl_edges;
+        census.memcpy_nodes = memcpy_nodes;
+        rc = cgp_exec_register_expect(&census);
+        if (rc)
+          fprintf(stderr, "[foundry] exec share: cgp_exec_register_expect failed (%d)\n", rc);
+      }
+      shared.exec = reinterpret_cast<CUgraphExec>(
+          instantiate_graph_exec(reinterpret_cast<cudaGraph_t>(shared.graph)));
+    } catch (...) {
+      cgp_exec_register_end(nullptr, 0);  // cancels the scope
+      throw;
+    }
+    rc = cgp_exec_register_end(shared.exec, kernels);
+    if (rc)  // the first switch of this exec then fails at cgp_exec_update
+      fprintf(stderr, "[foundry] exec share: cgp_exec_register_end failed (%d)\n", rc);
+  }
+  // Upload before the first update: an update ahead of an exec's first upload
+  // demotes every changed node (docs/exec-update-penalty.md).
+  C10_CUDA_DRIVER_CHECK(cuGraphUpload(shared.exec, nullptr));
+}
+
+std::string CUDAGraph::exec_share_stats() const {
+  boost::json::object out;
+  if (on_demand_data_ && on_demand_data_->shared_exec) {
+    auto& shared = *on_demand_data_->shared_exec;
+    std::lock_guard<std::mutex> lock(shared.replay_mutex);
+    out["enabled"] = shared.share;
+    out["route"] = exec_share::patched_route() ? "cgp" : "cuGraphExecUpdate";
+    out["valid"] = shared.valid;
+    out["exec"] = reinterpret_cast<uintptr_t>(shared.exec);
+    out["graph_id"] = on_demand_data_->graph_id;
+    out["current_graph_id"] = shared.current_params_id;
+    out["updates"] = shared.updates;
+    out["rewrite_ns"] = shared.rewrite_ns;
+    out["update_ns"] = shared.update_ns;
+    out["upload_ns"] = shared.upload_ns;
+  } else {
+    out["enabled"] = false;
+  }
+  return boost::json::serialize(out);
 }
 
 void CUDAGraph::transfer_to_shared_exec(std::shared_ptr<SharedGraphExec> shared,
