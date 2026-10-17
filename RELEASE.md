@@ -1,16 +1,64 @@
-# Foundry 0.1.0rc2
+# Foundry 0.1.0rc3
+
+Second release candidate of 0.1.0 (same wheel pairs and index layout as rc2).
+
+## Highlights
+
+- **Exec share mode** (`FOUNDRY_ENABLE_EXEC_SHARE=1`): one executable graph per
+  template, members switched with `cuGraphExecUpdate`; members are grouped by
+  their per-node kernel binaries, not only by function name. The lazy exec path
+  is gone; Phase-2 errors propagate. Works without cudagraph-patch (real
+  `cuGraphExecUpdate` route) and takes the patched route when the patch is
+  preloaded (weak `cgp_*` symbols).
+- **Faster SGLang bootstrap:** `NVSHMEM_DISABLE_NCCL=1` is pinned (NVSHMEM's
+  per-team NCCL communicators cost 2.4-6 s and 1.5 GB per DeepEP bootstrap and
+  are unused by the low-latency kernels: 3.5 -> 0.7 s), and Triton's cache key
+  is computed on a background thread during weight load (-0.3 s per LOAD).
+- A device-linked library loaded with `cuLibraryLoadData` (NCCL 2.30.7) is
+  restored with the same call instead of `cuLinkAddData`, which failed with
+  error 209 on drivers older than the library's toolkit.
+- **Recipes** (`recipe/sglang/`): plain `--cuda-graph-persistence` serve
+  scripts, one shared `set_env.sh` (dynamo off, DeepGEMM precompile off,
+  NVSHMEM NCCL off, DeepEP v2 GIN off, single-node IB off, host-registered
+  pinned buffers), dense decode graphs 1..256 by default, GLM-5.3-Flash and
+  Qwen3-235B-A22B added, `--attn-dp-size` instead of the deprecated
+  `--dp-size N --enable-dp-attention`.
+- **Tests** restructured into tiers with markers applied by directory
+  (`tests/unit`, `core`, `multigpu`, `sgl`, `sgl/e2e`); `pytest tests` runs in
+  about 5 minutes on one GPU, the Qwen3.5-35B-A3B 2-GPU e2e (tp2, ep2, tpep2)
+  and the 4-GPU cases are opt-in (`tests/README.md`).
+
+## Removed
+
+- `foundry.graph.CUDAGraph.instantiate` / `raw_cuda_graph_exec` (never bound).
+
+## Validation
+
+2x H200 (driver 595.71.05, torch 2.14.1 / cu130, SGLang foundry-dep
+e5ba719e30), 2026-10-16: default test run 207 passed; Qwen3.5-35B-A3B tp2 /
+ep2 / tpep2, Qwen3-14B tp1 / tp2 / dp2 and Qwen3-30B-A3B-FP8 ep2 (DeepEP v2):
+native, SAVE and LOAD greedy outputs identical, LOAD restores 256 graphs per
+rank in 0.26-0.44 s against 16-25 s of native capture, TPOT within 0.3% of
+native. Exec share LOAD without cudagraph-patch verified (real route, 256
+graphs per rank in 0.7 s). The 16 cold-start rows of the paper (4x H200)
+remain strict-exact with the NVSHMEM pin.
+
+## Upgrading
+
+- Archives written with rc2 still load; re-SAVE to get the `cuLibraryLoadData`
+  restore and the NVSHMEM-pin allocation layout (SAVE and LOAD must run with
+  the same `set_env.sh`).
+- SGLang's `--dp-size N --enable-dp-attention` is deprecated: use
+  `--attn-dp-size N` (the recipes do).
+
+## Previous Releases
+
+## Foundry 0.1.0rc2
 
 Release candidate of 0.1.0: the first release on PyPI (`foundry-core`, import
 name `foundry`) and the first one SGLang can depend on.
 
-## Next release (since 0.1.0rc2)
-
-- A device-linked library loaded with `cuLibraryLoadData` (NCCL 2.30.7) is
-  restored with the same call instead of `cuLinkAddData`, which failed with
-  error 209 on drivers older than the library's toolkit. Archives must be
-  re-saved to use it; older archives still load.
-
-## Highlights
+### Highlights
 
 - `pip install foundry-core`: manylinux_2_28 wheels for CPython 3.10-3.13,
   built against torch 2.14.1 / cu130 (SGLang's pin).
@@ -26,7 +74,7 @@ name `foundry`) and the first one SGLang can depend on.
   prewarm.
 - No Boost runtime dependency (header-only, vendored subset).
 
-## Fixes
+### Fixes
 
 - Fatbin packing: the archived image is 30-35 MB and mmap'd on LOAD.
 - One preallocation mechanism on LOAD.
@@ -37,7 +85,7 @@ name `foundry`) and the first one SGLang can depend on.
   `verbs_udev_wait_shim_path`).
 - The hook preload is scoped to the scheduler spawn.
 
-## Validation
+### Validation
 
 4xH200, torch 2.14.1 / cu130: Qwen3-30B-A3B-FP8 (real weights, 7 layouts),
 Qwen3-235B-A22B-FP8, Qwen3.5-122B-A10B-FP8, Qwen3.5-35B-A3B,
@@ -45,7 +93,7 @@ DeepSeek-V4-Flash-FP8, GLM-5.3-Flash and gpt-oss-120b in EP, TP and
 DP-attention layouts, plus the 1-GPU e2e; native, SAVE and LOAD outputs agree
 and LOAD TTFT / TPOT match native (`docs/sglang/validated-configs.md`).
 
-## Packaging
+### Packaging
 
 - `FOUNDRY_WHEEL_BUILD=1` builds a relocatable wheel; `FOUNDRY_SDIST=1` builds
   the sdist without a CUDA toolkit.
@@ -54,7 +102,7 @@ and LOAD TTFT / TPOT match native (`docs/sglang/validated-configs.md`).
   `gh-pages`); `tools/release/build_wheel.sh` runs the same steps locally. See
   `docs/release.md`.
 
-## Upgrading
+### Upgrading
 
 - `pip uninstall foundry` before installing `foundry-core`.
 - Archives written before this release (`capture_loop_version` < 2) must be
@@ -62,8 +110,6 @@ and LOAD TTFT / TPOT match native (`docs/sglang/validated-configs.md`).
 - Source builds need Boost headers only (no `libboost-*` libraries).
 - Other torch versions keep building from source
   (`pip install -e . --no-build-isolation`).
-
-## Previous Releases
 
 ## Foundry 0.0.3
 
