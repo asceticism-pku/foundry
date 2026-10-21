@@ -304,7 +304,7 @@ def _patch_cuda_graph_capture() -> None:
         # the warmup pass on SAVE but by bootstrap on LOAD, its VMM address
         # differed between modes and one-sided NVSHMEM traffic + restored-graph
         # references then corrupted whatever tensor later reused that VA
-        # (docs/sglang/known-issues.md).
+        # (docs/sglang/hooks.md).
         if _ep_lazy_init_needed():
             from foundry.integration.sglang.graph_ops import bootstrap_deepep_buffer
 

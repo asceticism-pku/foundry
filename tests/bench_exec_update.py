@@ -34,7 +34,7 @@ Key facts these cases established (H200, r595.58.03): updates applied before
 the exec's first upload demote every byte-changed node (~0.1 us/node/replay,
 permanent); after upload, argument changes are free but launch-config
 changes (grid/block/shmem/func) still demote; execs <=128 nodes never
-demote. See docs/exec-update-penalty.md.
+demote. See docs/graph-templates.md.
 
 Usage: python bench_exec_update.py [--cases core] [--nodes 365]
                                    [--replays 3000] [--rounds 5]

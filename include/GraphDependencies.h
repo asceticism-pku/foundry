@@ -15,7 +15,7 @@ namespace foundry {
 // 580.126.20 through 610.57.04 apply edge_data[0] to every edge of the call. A
 // rebuilt graph normally leads with a default edge, so one bulk call silently
 // turned every programmatic (PDL) edge into a full-completion barrier and cost
-// 1-7% TPOT (docs/pdl-edge-batching.md). Insert one homogeneous batch per
+// 1-7% TPOT. Insert one homogeneous batch per
 // distinct edge record; each batch still passes a full array, so this is also
 // correct on drivers that honour the documented contract.
 inline CUresult add_graph_dependencies(CUgraph graph, const CUgraphNode* from,
