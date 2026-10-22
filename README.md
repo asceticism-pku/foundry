@@ -4,7 +4,7 @@ Foundry captures CUDA graphs and restores them across process restarts. It persi
 
 ## Installation
 
-Use Linux, standard CPython 3.10 (>=3.10,<3.11) with the GIL enabled, a CUDA-enabled PyTorch environment, CMake 4+, and Boost 1.83+. Install the inference engine before building Foundry in the same environment.
+Use Linux, Python 3.10+, a CUDA-enabled PyTorch environment, CMake 4+, and Boost 1.83+. Install the inference engine before building Foundry in the same environment.
 
 From the Foundry directory:
 
